@@ -1,6 +1,6 @@
 # BackendWithAI
 
-A domain-agnostic, reusable Go backend framework for AI-powered SaaS applications. Provides foundational components for RAG, fine-tuning, document processing, and LLM-powered workflows in any vertical.
+A domain-agnostic, reusable Go backend framework for AI-powered SaaS applications. Provides foundational components for RAG, fine-tuning, document processing, agents, guardrails, reasoning, evals, and LLM-powered workflows in any vertical.
 
 ## Tech Stack
 
@@ -15,7 +15,7 @@ A domain-agnostic, reusable Go backend framework for AI-powered SaaS application
 | # | Component | Description |
 |---|-----------|-------------|
 | 1 | **LLM Gateway** | Multi-provider abstraction (OpenAI, Anthropic, Ollama), streaming, retry/fallback, cost tracking |
-| 2 | **RAG Pipeline** | Ingest → chunk → embed → store in pgvector → retrieve → generate with citations |
+| 2 | **RAG Pipeline** | Ingest → chunk → embed → store in pgvector → retrieve → rerank → generate with citations. Includes HyDE, query rewriting, multi-query retrieval |
 | 3 | **Document Processing** | Upload, text extraction (PDF/DOCX/TXT), OCR, async processing via Asynq |
 | 4 | **Prompt Management** | Template storage, versioning, `{{variable}}` interpolation, per-tenant overrides |
 | 5 | **Fine-tuning Orchestration** | Dataset management, training job submission, model registry |
@@ -24,6 +24,12 @@ A domain-agnostic, reusable Go backend framework for AI-powered SaaS application
 | 8 | **Audit & Observability** | AI call logging, cost aggregation, activity trail, health checks |
 | 9 | **Webhook/Event System** | Internal event bus, HMAC-signed webhook delivery with retry |
 | 10 | **API Layer** | Chi router, middleware stack (CORS, rate limiting, logging), versioned routes |
+| 11 | **Agents** | ReAct pattern, tool calling, prompt chaining, multi-agent orchestration, LLM-based routing |
+| 12 | **Guardrails** | Prompt injection detection (heuristic + LLM), content filtering, PII detection, input length validation |
+| 13 | **Memory** | BufferMemory (sliding window), TokenWindowMemory (token budget), SummaryMemory (auto-summarization), ContextEngine (token-aware prompt assembly) |
+| 14 | **Evals** | LLM-as-Judge, pairwise comparison, relevance scoring, faithfulness evaluation, hallucination detection, claim extraction |
+| 15 | **Reasoning** | Chain-of-Thought (zero-shot, few-shot), Tree-of-Thought, Self-Consistency, Reflection (generate-critique-revise), Structured Output |
+| 16 | **Multimodal** | Vision analysis (GPT-4o/Claude), image generation (DALL-E), text-to-speech, OCR via vision models |
 
 ## Quick Start
 
@@ -75,7 +81,9 @@ BackendWithAI/
 │   │   ├── pipeline.go              # Full RAG orchestration (ingest + query)
 │   │   ├── chunker.go               # Text chunking integration
 │   │   ├── retriever.go             # Vector + keyword hybrid retrieval
-│   │   └── generator.go             # Context assembly + LLM generation with citations
+│   │   ├── generator.go             # Context assembly + LLM generation with citations
+│   │   ├── reranker.go              # LLM reranker + cross-encoder reranker
+│   │   └── query_rewriter.go        # Query rewriting, multi-query, HyDE
 │   ├── embedding/service.go         # Embedding generation via LLM gateway
 │   ├── vectorstore/
 │   │   ├── store.go                 # VectorStore interface
@@ -91,6 +99,31 @@ BackendWithAI/
 │   │   ├── service.go               # Job submission + status
 │   │   ├── dataset.go               # JSONL validation + formatting
 │   │   └── registry.go              # Model registry
+│   ├── agent/
+│   │   ├── agent.go                 # ReAct agent with tool calling + memory
+│   │   ├── tools.go                 # Built-in tools (calculator, RAG search, web fetch, JSON extractor)
+│   │   ├── react.go                 # ReAct response parser
+│   │   └── orchestrator.go          # Multi-agent orchestration, LLM router, prompt chaining
+│   ├── guardrails/
+│   │   ├── guardrails.go            # Pipeline, PII detector, input length guard
+│   │   ├── prompt_injection.go      # Heuristic + LLM-based prompt injection detection
+│   │   ├── content_filter.go        # Keyword-based content filtering
+│   │   └── intent.go                # LLM-based intent classification
+│   ├── memory/
+│   │   ├── memory.go                # BufferMemory (sliding window), TokenWindowMemory (token budget)
+│   │   ├── summary.go               # SummaryMemory (auto-summarizes via LLM)
+│   │   └── context_engine.go        # ContextEngine (assembles prompt within token budgets)
+│   ├── eval/
+│   │   ├── eval.go                  # EvalSuite, relevance evaluator, faithfulness evaluator
+│   │   ├── judge.go                 # LLM-as-Judge (multi-dimensional), pairwise comparison
+│   │   └── hallucination.go         # Hallucination detector, claim extraction + verification
+│   ├── reasoning/
+│   │   ├── cot.go                   # Chain-of-Thought (zero-shot, few-shot)
+│   │   ├── tot.go                   # Tree-of-Thought, Self-Consistency
+│   │   └── structured.go            # Structured output, Reflection pattern
+│   ├── multimodal/
+│   │   ├── vision.go                # Vision analysis, image description, OCR, comparison
+│   │   └── generation.go            # Image generation (DALL-E), text-to-speech
 │   ├── storage/supabase.go          # Supabase Storage client
 │   ├── queue/
 │   │   ├── client.go                # Asynq client wrapper
@@ -105,7 +138,7 @@ BackendWithAI/
 │   └── api/
 │       ├── router.go                # Chi router + full route wiring
 │       ├── middleware/               # Rate limiting, CORS, request logging
-│       └── handlers/                # Health, LLM, RAG, documents, prompts, finetune, webhooks, admin
+│       └── handlers/                # All API endpoint handlers
 ├── pkg/
 │   ├── chunker/chunker.go           # Chunking strategies (fixed, recursive, sentence)
 │   ├── tokenizer/tokenizer.go       # Token counting
@@ -147,7 +180,7 @@ BackendWithAI/
 ### RAG
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/v1/rag/query` | RAG query (retrieve + generate with citations) |
+| `POST` | `/api/v1/rag/query` | RAG query (retrieve + rerank + generate with citations) |
 | `POST` | `/api/v1/rag/search` | Vector search only (no generation) |
 
 ### Prompts
@@ -169,6 +202,40 @@ BackendWithAI/
 | `GET` | `/api/v1/finetune/jobs/:id` | Job status |
 | `GET` | `/api/v1/finetune/models` | List fine-tuned models |
 
+### Agents
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/agents/run` | Execute ReAct agent with tools |
+| `POST` | `/api/v1/agents/chain` | Execute prompt chain |
+
+### Guardrails
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/guardrails/check` | Validate text against safety checks |
+| `POST` | `/api/v1/guardrails/classify` | Intent classification |
+
+### Evals
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/eval/suite` | Run full eval suite (relevance, faithfulness, hallucination, judge) |
+| `POST` | `/api/v1/eval/judge` | LLM-as-Judge scoring (accuracy, completeness, clarity, helpfulness) |
+| `POST` | `/api/v1/eval/compare` | Pairwise A/B comparison of two responses |
+
+### Reasoning
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/reasoning/cot` | Chain-of-Thought reasoning (zero-shot or few-shot) |
+| `POST` | `/api/v1/reasoning/tot` | Tree-of-Thought (explore multiple paths) |
+| `POST` | `/api/v1/reasoning/self-consistency` | Self-Consistency (sample multiple, take majority) |
+| `POST` | `/api/v1/reasoning/reflect` | Reflection pattern (generate → critique → revise) |
+
+### Multimodal
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/multimodal/vision` | Vision analysis (describe, OCR, compare images) |
+| `POST` | `/api/v1/multimodal/image/generate` | Image generation (DALL-E) |
+| `POST` | `/api/v1/multimodal/tts` | Text-to-speech |
+
 ### Webhooks
 | Method | Path | Description |
 |--------|------|-------------|
@@ -181,6 +248,83 @@ BackendWithAI/
 |--------|------|-------------|
 | `GET` | `/api/v1/admin/usage` | Cost dashboard data |
 | `GET` | `/api/v1/admin/audit` | Audit logs |
+
+## AI Concepts Covered
+
+This framework implements the following AI/LLM engineering patterns:
+
+### LLM Fundamentals
+- Multi-provider gateway (OpenAI, Anthropic, Ollama) with automatic fallback and retry
+- Streaming via SSE (Server-Sent Events)
+- Token counting and cost tracking per model/provider
+- Temperature, top-p, stop sequence configuration
+
+### RAG (Retrieval-Augmented Generation)
+- **Chunking**: Fixed-size, recursive, sentence-based strategies
+- **Embedding**: Batch embedding via provider APIs
+- **Vector Store**: pgvector with IVFFlat indexing
+- **Hybrid Search**: Vector similarity + BM25 keyword search
+- **Reranking**: LLM-based reranker and cross-encoder reranker
+- **Query Rewriting**: Multi-query generation for better recall
+- **HyDE**: Hypothetical Document Embeddings — generate a hypothetical answer, embed it, search with that
+- **Citations**: Generated answers include source references
+
+### Agents & Tool Use
+- **ReAct Pattern**: Thought → Action → Observation loop
+- **Tool Calling**: Calculator, RAG search, web fetch, JSON extractor
+- **Prompt Chaining**: Sequential LLM calls with output piping
+- **Multi-Agent Orchestration**: Multiple specialized agents coordinated by an orchestrator
+- **LLM-Based Routing**: Route messages to the best agent via LLM classification
+
+### Memory & Context
+- **BufferMemory**: Sliding window of last N messages
+- **TokenWindowMemory**: Keep messages within a token budget
+- **SummaryMemory**: Auto-summarize older messages via LLM to preserve context
+- **ContextEngine**: Assemble system prompt + memory + RAG context within token budgets
+
+### Guardrails & Safety
+- **Prompt Injection Detection**: Heuristic pattern matching + LLM-based detection
+- **Content Filtering**: Keyword-based harmful content detection
+- **PII Detection**: Pattern-based detection of SSNs, credit cards, passwords
+- **Input Length Validation**: Configurable max input length
+- **Intent Classification**: LLM-based intent detection with configurable intents
+
+### Evaluation
+- **LLM-as-Judge**: Multi-dimensional scoring (accuracy, completeness, clarity, helpfulness)
+- **Pairwise Comparison**: A/B testing of two responses
+- **Relevance Scoring**: How relevant is the response to the query?
+- **Faithfulness Evaluation**: Does the response stick to the provided context? (RAG grounding)
+- **Hallucination Detection**: Grounded (vs. context) and open-ended (factual) checks
+- **Claim Extraction**: Break response into individual claims, verify each one
+
+### Reasoning Patterns
+- **Chain-of-Thought (CoT)**: Zero-shot ("Let's think step by step") and few-shot (worked examples)
+- **Tree-of-Thought (ToT)**: Explore multiple reasoning paths in parallel, score and pick best
+- **Self-Consistency**: Sample multiple chains, take the majority answer
+- **Reflection**: Generate → critique → revise loop for iterative improvement
+- **Structured Output**: Force LLM responses into defined JSON schemas
+
+### Multimodal
+- **Vision Analysis**: Image understanding via GPT-4o / Claude vision models
+- **Image Description**: Detailed image captioning
+- **OCR via Vision**: Extract text from images using vision models
+- **Image Generation**: DALL-E integration for text-to-image
+- **Text-to-Speech**: TTS via OpenAI API
+- **Multi-Image Comparison**: Compare multiple images on specified aspects
+
+### Fine-tuning
+- **Dataset Management**: Upload, validate, format as JSONL
+- **Job Orchestration**: Submit training jobs, poll status, track completion
+- **Model Registry**: Catalog fine-tuned models with metadata
+
+### Infrastructure
+- **Multi-tenancy**: Tenant isolation via JWT + row-level context
+- **RBAC**: Role-based access control with permission checking
+- **API Key Auth**: SHA-256 hashed API keys with scopes
+- **Rate Limiting**: Token bucket algorithm
+- **Job Queue**: Asynq workers for document processing, embedding, fine-tuning
+- **Webhook Delivery**: HMAC-SHA256 signed payloads with retry
+- **Audit Logging**: Track all AI calls, costs, and user actions
 
 ## Configuration
 
@@ -227,16 +371,24 @@ type VectorStore interface {
     Delete(ctx context.Context, filter DeleteFilter) error
 }
 
-// RAG Pipeline
-type Pipeline interface {
-    Ingest(ctx context.Context, doc IngestRequest) error
-    Query(ctx context.Context, req QueryRequest) (*QueryResponse, error)
-    Search(ctx context.Context, req SearchRequest) ([]SearchResult, error)
+// Guardrail — implement for custom safety checks
+type Guardrail interface {
+    Check(ctx context.Context, text string) (*GuardrailResult, error)
+    Name() string
 }
 
-// Chunker — implement for custom chunking strategies
-type Chunker interface {
-    Chunk(text string, opts ChunkOptions) []TextChunk
+// Evaluator — implement for custom eval metrics
+type Evaluator interface {
+    Evaluate(ctx context.Context, input EvalInput) (*EvalResult, error)
+    Name() string
+}
+
+// Memory — implement for custom memory backends
+type Memory interface {
+    Add(ctx context.Context, entry Entry)
+    Get(ctx context.Context, limit int) []Entry
+    Clear(ctx context.Context)
+    Size() int
 }
 ```
 

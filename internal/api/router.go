@@ -154,6 +154,45 @@ func (rt *Router) Setup() http.Handler {
 			r.Get("/usage", adminH.Usage)
 			r.Get("/audit", adminH.AuditLogs)
 		})
+
+		// Agent routes
+		agentH := handlers.NewAgentHandler(rt.llmGW)
+		r.Route("/agents", func(r chi.Router) {
+			r.Post("/run", agentH.Run)
+			r.Post("/chain", agentH.Chain)
+		})
+
+		// Guardrails routes
+		guardrailH := handlers.NewGuardrailHandler(rt.llmGW)
+		r.Route("/guardrails", func(r chi.Router) {
+			r.Post("/check", guardrailH.Check)
+			r.Post("/classify", guardrailH.Classify)
+		})
+
+		// Eval routes
+		evalH := handlers.NewEvalHandler(rt.llmGW)
+		r.Route("/eval", func(r chi.Router) {
+			r.Post("/suite", evalH.RunSuite)
+			r.Post("/judge", evalH.Judge)
+			r.Post("/compare", evalH.Compare)
+		})
+
+		// Reasoning routes
+		reasoningH := handlers.NewReasoningHandler(rt.llmGW)
+		r.Route("/reasoning", func(r chi.Router) {
+			r.Post("/cot", reasoningH.ChainOfThought)
+			r.Post("/tot", reasoningH.TreeOfThought)
+			r.Post("/self-consistency", reasoningH.SelfConsistency)
+			r.Post("/reflect", reasoningH.Reflect)
+		})
+
+		// Multimodal routes
+		multimodalH := handlers.NewMultimodalHandler(rt.llmGW, rt.cfg.LLM.OpenAIKey)
+		r.Route("/multimodal", func(r chi.Router) {
+			r.Post("/vision", multimodalH.Analyze)
+			r.Post("/image/generate", multimodalH.GenerateImage)
+			r.Post("/tts", multimodalH.Speak)
+		})
 	})
 
 	return r
