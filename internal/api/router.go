@@ -17,6 +17,8 @@ import (
 	"github.com/nikhilbhutani/backendwithai/internal/embedding"
 	"github.com/nikhilbhutani/backendwithai/internal/finetune"
 	"github.com/nikhilbhutani/backendwithai/internal/llm"
+	"github.com/nikhilbhutani/backendwithai/internal/multimodal/stt"
+	"github.com/nikhilbhutani/backendwithai/internal/multimodal/tts"
 	"github.com/nikhilbhutani/backendwithai/internal/prompt"
 	"github.com/nikhilbhutani/backendwithai/internal/queue"
 	"github.com/nikhilbhutani/backendwithai/internal/rag"
@@ -25,6 +27,35 @@ import (
 	"github.com/nikhilbhutani/backendwithai/internal/vectorstore"
 	"github.com/nikhilbhutani/backendwithai/internal/webhook"
 )
+
+func buildSTTProvider(cfg config.STTConfig) stt.STTProvider {
+	switch cfg.Backend {
+	case "local":
+		return stt.NewLocalSTT(stt.LocalSTTConfig{BaseURL: cfg.LocalBaseURL})
+	default:
+		return stt.NewOpenAISTT(stt.OpenAISTTConfig{
+			APIKey:  cfg.OpenAIKey,
+			BaseURL: cfg.OpenAIBaseURL,
+			Model:   cfg.OpenAIModel,
+		})
+	}
+}
+
+func buildTTSProvider(cfg config.TTSConfig) tts.TTSProvider {
+	switch cfg.Backend {
+	case "local":
+		return tts.NewLocalTTS(tts.LocalTTSConfig{
+			PiperBinPath: cfg.LocalBinPath,
+			ModelPath:    cfg.LocalModel,
+		})
+	default:
+		return tts.NewOpenAITTS(tts.OpenAITTSConfig{
+			APIKey:  cfg.OpenAIKey,
+			BaseURL: cfg.OpenAIBaseURL,
+			Model:   cfg.OpenAIModel,
+		})
+	}
+}
 
 type Router struct {
 	mux    *chi.Mux
@@ -187,11 +218,14 @@ func (rt *Router) Setup() http.Handler {
 		})
 
 		// Multimodal routes
-		multimodalH := handlers.NewMultimodalHandler(rt.llmGW, rt.cfg.LLM.OpenAIKey)
+		sttProvider := buildSTTProvider(rt.cfg.STT)
+		ttsProvider := buildTTSProvider(rt.cfg.TTS)
+		multimodalH := handlers.NewMultimodalHandler(rt.llmGW, rt.cfg.LLM.OpenAIKey, sttProvider, ttsProvider)
 		r.Route("/multimodal", func(r chi.Router) {
 			r.Post("/vision", multimodalH.Analyze)
 			r.Post("/image/generate", multimodalH.GenerateImage)
 			r.Post("/tts", multimodalH.Speak)
+			r.Post("/stt", multimodalH.Transcribe)
 		})
 	})
 

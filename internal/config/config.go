@@ -14,6 +14,8 @@ type Config struct {
 	Auth     AuthConfig
 	LLM      LLMConfig
 	Storage  StorageConfig
+	STT      STTConfig
+	TTS      TTSConfig
 }
 
 type ServerConfig struct {
@@ -55,6 +57,23 @@ type StorageConfig struct {
 	SupabaseURL    string
 	SupabaseKey    string
 	Bucket         string
+}
+
+type STTConfig struct {
+	Backend       string // "openai" or "local"
+	OpenAIKey     string
+	OpenAIBaseURL string
+	OpenAIModel   string
+	LocalBaseURL  string // default: "http://localhost:8178"
+}
+
+type TTSConfig struct {
+	Backend       string // "openai" or "local"
+	OpenAIKey     string
+	OpenAIBaseURL string
+	OpenAIModel   string
+	LocalBinPath  string // default: "piper"
+	LocalModel    string // required when backend=local
 }
 
 func Load() (*Config, error) {
@@ -118,6 +137,21 @@ func Load() (*Config, error) {
 			SupabaseURL: getEnv("SUPABASE_URL", ""),
 			SupabaseKey: getEnv("SUPABASE_SERVICE_KEY", ""),
 			Bucket:      getEnv("STORAGE_BUCKET", "documents"),
+		},
+		STT: STTConfig{
+			Backend:       getEnv("STT_BACKEND", "openai"),
+			OpenAIKey:     getEnv("OPENAI_API_KEY", ""),
+			OpenAIBaseURL: getEnv("STT_OPENAI_BASE_URL", ""),
+			OpenAIModel:   getEnv("STT_OPENAI_MODEL", ""),
+			LocalBaseURL:  getEnv("STT_LOCAL_BASE_URL", "http://localhost:8178"),
+		},
+		TTS: TTSConfig{
+			Backend:       getEnv("TTS_BACKEND", "openai"),
+			OpenAIKey:     getEnv("OPENAI_API_KEY", ""),
+			OpenAIBaseURL: getEnv("TTS_OPENAI_BASE_URL", ""),
+			OpenAIModel:   getEnv("TTS_OPENAI_MODEL", ""),
+			LocalBinPath:  getEnv("TTS_LOCAL_PIPER_BIN", "piper"),
+			LocalModel:    getEnv("TTS_LOCAL_PIPER_MODEL", ""),
 		},
 	}
 
