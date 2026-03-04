@@ -15,7 +15,7 @@ A domain-agnostic, reusable Go backend framework for AI-powered SaaS application
 | # | Component | Description |
 |---|-----------|-------------|
 | 1 | **LLM Gateway** | Multi-provider abstraction (OpenAI, Anthropic, Ollama), streaming, retry/fallback, cost tracking |
-| 2 | **RAG Pipeline** | Ingest → chunk → embed → store in pgvector → retrieve → rerank → generate with citations. Includes HyDE, query rewriting, multi-query retrieval |
+| 2 | **RAG Pipeline** | Ingest → chunk → embed → store in pgvector → retrieve → rerank → generate with citations. Includes intelligent query routing, RRF fusion, query decomposition, semantic chunking, RAPTOR hierarchical indexing, multi-representation indexing, HyDE, and multi-query rewriting |
 | 3 | **Document Processing** | Upload, text extraction (PDF/DOCX/TXT), OCR, async processing via Asynq |
 | 4 | **Prompt Management** | Template storage, versioning, `{{variable}}` interpolation, per-tenant overrides |
 | 5 | **Fine-tuning Orchestration** | Dataset management, training job submission, model registry |
@@ -78,12 +78,18 @@ BackendWithAI/
 │   │   ├── ollama.go                # Ollama local provider
 │   │   └── cost.go                  # Token counting + cost calculation
 │   ├── rag/
-│   │   ├── pipeline.go              # Full RAG orchestration (ingest + query)
-│   │   ├── chunker.go               # Text chunking integration
+│   │   ├── pipeline.go              # Full RAG orchestration (ingest + query + routing)
+│   │   ├── router.go                # LLM query classifier (simple/complex/comparison)
+│   │   ├── decomposer.go            # Query decomposition for complex questions
+│   │   ├── fusion.go                # Reciprocal Rank Fusion (RRF) for multi-result merging
+│   │   ├── chunker.go               # Text chunking integration (incl. semantic)
 │   │   ├── retriever.go             # Vector + keyword hybrid retrieval
 │   │   ├── generator.go             # Context assembly + LLM generation with citations
 │   │   ├── reranker.go              # LLM reranker + cross-encoder reranker
-│   │   └── query_rewriter.go        # Query rewriting, multi-query, HyDE
+│   │   ├── query_rewriter.go        # Query rewriting, multi-query, HyDE
+│   │   └── indexing/
+│   │       ├── raptor.go            # RAPTOR hierarchical indexing (cluster + summarise)
+│   │       └── multi_rep.go         # Multi-representation indexing (summary embed, full content)
 │   ├── embedding/service.go         # Embedding generation via LLM gateway
 │   ├── vectorstore/
 │   │   ├── store.go                 # VectorStore interface
@@ -140,10 +146,13 @@ BackendWithAI/
 │       ├── middleware/               # Rate limiting, CORS, request logging
 │       └── handlers/                # All API endpoint handlers
 ├── pkg/
-│   ├── chunker/chunker.go           # Chunking strategies (fixed, recursive, sentence)
+│   ├── chunker/
+│   │   ├── chunker.go               # Chunking strategies (fixed, recursive, sentence)
+│   │   └── semantic.go              # Semantic chunking (embedding-based topic boundaries)
 │   ├── tokenizer/tokenizer.go       # Token counting
 │   └── textextract/extract.go       # PDF, DOCX, TXT extraction
-├── migrations/                      # SQL migration files (001-006)
+├── migrations/                      # SQL migration files (001-007)
+├── docs/rag-architecture.md         # Full RAG architecture documentation
 ├── docker-compose.yml               # Redis + PostgreSQL (pgvector) for local dev
 ├── Dockerfile                       # Multi-stage build
 ├── Makefile
@@ -182,6 +191,40 @@ BackendWithAI/
 |--------|------|-------------|
 | `POST` | `/api/v1/rag/query` | RAG query (retrieve + rerank + generate with citations) |
 | `POST` | `/api/v1/rag/search` | Vector search only (no generation) |
+
+**Query — automatic routing (router classifies the query automatically):**
+```json
+POST /api/v1/rag/query
+{
+  "query": "Compare transformer vs CNN architectures for NLP tasks",
+  "top_k": 8,
+  "hybrid": true,
+  "rerank": true
+}
+// Response includes routing_info showing which strategy was selected:
+// { "routing_info": { "strategy": "comparison", "reasoning": "comparing two architectures" } }
+```
+
+**Query — force a strategy:**
+```json
+{ "query": "...", "strategy": "complex", "top_k": 10 }
+```
+
+**Ingest — standard (recursive chunking):**
+```json
+POST /api/v1/rag/ingest
+{ "document_id": "...", "content": "...", "chunk_opts": { "strategy": "recursive", "chunk_size": 512 } }
+```
+
+**Ingest — semantic chunking + multi-representation indexing:**
+```json
+{ "document_id": "...", "content": "...", "chunk_opts": { "strategy": "semantic" }, "index_type": "multi_rep" }
+```
+
+**Ingest — RAPTOR hierarchical indexing:**
+```json
+{ "document_id": "...", "content": "...", "chunk_opts": { "strategy": "recursive" }, "index_type": "raptor" }
+```
 
 ### Prompts
 | Method | Path | Description |
@@ -260,14 +303,29 @@ This framework implements the following AI/LLM engineering patterns:
 - Temperature, top-p, stop sequence configuration
 
 ### RAG (Retrieval-Augmented Generation)
-- **Chunking**: Fixed-size, recursive, sentence-based strategies
+
+**Pillar 1 — Query Construction**
+- **Vector Search**: pgvector with IVFFlat indexing
+- **Hybrid Search**: Vector similarity + BM25 keyword search combined
+- **HyDE**: Hypothetical Document Embeddings — generate a hypothetical answer, embed it, search with that
+
+**Pillar 2 — Intelligent Routing**
+- **Query Router**: LLM classifies each query as `simple`, `complex`, or `comparison` and picks the best retrieval strategy automatically
+- **Query Decomposition**: Complex multi-part questions are broken into 2–4 focused sub-questions, each retrieved independently
+- **Multi-Query Rewriting**: Comparison queries are expanded into multiple reformulations for broader recall
+- **RRF Fusion**: Results from multiple query variants are merged using Reciprocal Rank Fusion (`score = Σ 1/(k+rank)`, k=60) instead of naive deduplication
+
+**Pillar 3 — Advanced Indexing**
+- **Chunking**: Fixed-size, recursive, sentence-based, and **semantic** (embedding-based topic-boundary detection)
+- **RAPTOR**: Recursive Abstractive Processing for Tree-Organized Retrieval — clusters leaf chunks by cosine similarity, summarises each cluster with an LLM, and repeats up to the root; all levels stored for multi-abstraction retrieval
+- **Multi-Representation Indexing**: Embeds concise LLM summaries as search vectors but stores full original content for generation — better semantic match without losing context
 - **Embedding**: Batch embedding via provider APIs
-- **Vector Store**: pgvector with IVFFlat indexing
-- **Hybrid Search**: Vector similarity + BM25 keyword search
+
+**Pillar 4 — Evaluation**
 - **Reranking**: LLM-based reranker and cross-encoder reranker
 - **Query Rewriting**: Multi-query generation for better recall
-- **HyDE**: Hypothetical Document Embeddings — generate a hypothetical answer, embed it, search with that
 - **Citations**: Generated answers include source references
+- See [Evaluation](#evaluation) section for full eval suite
 
 ### Agents & Tool Use
 - **ReAct Pattern**: Thought → Action → Observation loop
@@ -349,7 +407,7 @@ Migrations are applied automatically on startup. To apply manually:
 make migrate
 ```
 
-6 migration files create tables for: tenants, users, roles, API keys, documents, document chunks (with pgvector), prompts, prompt versions, finetune datasets/jobs, model registry, LLM usage logs, audit logs, webhooks, and webhook deliveries.
+7 migration files create tables for: tenants, users, roles, API keys, documents, document chunks (with pgvector + `chunk_level`/`parent_chunk_id`/`chunk_type` for RAPTOR/multi-rep), prompts, prompt versions, finetune datasets/jobs, model registry, LLM usage logs, audit logs, webhooks, and webhook deliveries.
 
 ## Key Interfaces
 

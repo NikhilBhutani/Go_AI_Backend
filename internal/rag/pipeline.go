@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nikhilbhutani/backendwithai/internal/embedding"
 	"github.com/nikhilbhutani/backendwithai/internal/llm"
+	"github.com/nikhilbhutani/backendwithai/internal/rag/indexing"
 	"github.com/nikhilbhutani/backendwithai/internal/vectorstore"
 	"github.com/nikhilbhutani/backendwithai/pkg/chunker"
 )
@@ -17,30 +18,42 @@ type Pipeline interface {
 	Search(ctx context.Context, req SearchRequest) ([]vectorstore.SearchResult, error)
 }
 
+// IndexType controls which indexing strategy to use during ingestion.
+const (
+	IndexTypeStandard = "standard"
+	IndexTypeRaptor   = "raptor"
+	IndexTypeMultiRep = "multi_rep"
+)
+
 type IngestRequest struct {
 	DocumentID uuid.UUID
 	TenantID   uuid.UUID
 	Content    string
 	ChunkOpts  chunker.ChunkOptions
+	// IndexType selects the indexing strategy: "standard" (default), "raptor", "multi_rep".
+	IndexType string
 }
 
 type QueryRequest struct {
-	Query        string `json:"query"`
-	TopK         int    `json:"top_k,omitempty"`
+	Query        string  `json:"query"`
+	TopK         int     `json:"top_k,omitempty"`
 	MinScore     float64 `json:"min_score,omitempty"`
-	Hybrid       bool   `json:"hybrid,omitempty"`
-	Model        string `json:"model,omitempty"`
-	Provider     string `json:"provider,omitempty"`
-	Rerank       bool   `json:"rerank,omitempty"`        // enable LLM reranking
-	QueryRewrite bool   `json:"query_rewrite,omitempty"` // enable multi-query rewriting
-	UseHyDE      bool   `json:"use_hyde,omitempty"`      // enable HyDE
+	Hybrid       bool    `json:"hybrid,omitempty"`
+	Model        string  `json:"model,omitempty"`
+	Provider     string  `json:"provider,omitempty"`
+	Rerank       bool    `json:"rerank,omitempty"`        // enable LLM reranking
+	QueryRewrite bool    `json:"query_rewrite,omitempty"` // enable multi-query rewriting
+	UseHyDE      bool    `json:"use_hyde,omitempty"`      // enable HyDE
+	// Strategy overrides automatic routing: "simple", "complex", "comparison".
+	Strategy string `json:"strategy,omitempty"`
 }
 
 type QueryResponse struct {
-	Answer    string     `json:"answer"`
-	Citations []Citation `json:"citations"`
-	Model     string     `json:"model"`
-	Tokens    int        `json:"tokens"`
+	Answer      string     `json:"answer"`
+	Citations   []Citation `json:"citations"`
+	Model       string     `json:"model"`
+	Tokens      int        `json:"tokens"`
+	RoutingInfo RouteInfo  `json:"routing_info,omitempty"`
 }
 
 type SearchRequest struct {
@@ -54,24 +67,62 @@ type SearchRequest struct {
 }
 
 type pipeline struct {
-	store         vectorstore.VectorStore
-	embedSvc      *embedding.Service
-	retriever     *Retriever
-	generator     *Generator
-	reranker      Reranker
-	queryRewriter QueryRewriter
-	hyde          *HyDE
+	store          vectorstore.VectorStore
+	embedSvc       *embedding.Service
+	retriever      *Retriever
+	generator      *Generator
+	reranker       Reranker
+	queryRewriter  QueryRewriter
+	hyde           *HyDE
+	router         QueryRouter
+	decomposer     Decomposer
+	raptorIndexer  *indexing.RaptorIndexer
+	multiRepIndexer *indexing.MultiRepIndexer
+}
+
+// PipelineOptions allows optional component injection.
+type PipelineOptions struct {
+	Router          QueryRouter
+	Decomposer      Decomposer
+	RaptorIndexer   *indexing.RaptorIndexer
+	MultiRepIndexer *indexing.MultiRepIndexer
 }
 
 func NewPipeline(store vectorstore.VectorStore, embedSvc *embedding.Service, gw llm.Gateway) Pipeline {
+	return NewPipelineWithOptions(store, embedSvc, gw, PipelineOptions{})
+}
+
+// NewPipelineWithOptions creates a pipeline with optional advanced components.
+func NewPipelineWithOptions(store vectorstore.VectorStore, embedSvc *embedding.Service, gw llm.Gateway, opts PipelineOptions) Pipeline {
+	router := opts.Router
+	if router == nil {
+		router = NewLLMQueryRouter(gw, "")
+	}
+	decomposer := opts.Decomposer
+	if decomposer == nil {
+		decomposer = NewLLMDecomposer(gw, "")
+	}
+	raptorIndexer := opts.RaptorIndexer
+	if raptorIndexer == nil {
+		raptorIndexer = indexing.NewRaptorIndexer(store, embedSvc, gw, "")
+	}
+	multiRepIndexer := opts.MultiRepIndexer
+	if multiRepIndexer == nil {
+		multiRepIndexer = indexing.NewMultiRepIndexer(store, embedSvc, gw, "")
+	}
+
 	return &pipeline{
-		store:         store,
-		embedSvc:      embedSvc,
-		retriever:     NewRetriever(store, embedSvc),
-		generator:     NewGenerator(gw),
-		reranker:      NewLLMReranker(gw, ""),
-		queryRewriter: NewLLMQueryRewriter(gw, ""),
-		hyde:          NewHyDE(gw, ""),
+		store:           store,
+		embedSvc:        embedSvc,
+		retriever:       NewRetriever(store, embedSvc),
+		generator:       NewGenerator(gw),
+		reranker:        NewLLMReranker(gw, ""),
+		queryRewriter:   NewLLMQueryRewriter(gw, ""),
+		hyde:            NewHyDE(gw, ""),
+		router:          router,
+		decomposer:      decomposer,
+		raptorIndexer:   raptorIndexer,
+		multiRepIndexer: multiRepIndexer,
 	}
 }
 
@@ -81,7 +132,7 @@ func (p *pipeline) Ingest(ctx context.Context, req IngestRequest) error {
 		opts = chunker.DefaultOptions()
 	}
 
-	chunkResults := ChunkText(req.Content, opts)
+	chunkResults := ChunkTextWithEmbeddings(ctx, req.Content, opts, p.embedSvc)
 	if len(chunkResults) == 0 {
 		return fmt.Errorf("no chunks generated from content")
 	}
@@ -109,8 +160,15 @@ func (p *pipeline) Ingest(ctx context.Context, req IngestRequest) error {
 		}
 	}
 
-	if err := p.store.Upsert(ctx, chunks); err != nil {
-		return fmt.Errorf("store chunks: %w", err)
+	switch req.IndexType {
+	case IndexTypeRaptor:
+		return p.raptorIndexer.Index(ctx, chunks)
+	case IndexTypeMultiRep:
+		return p.multiRepIndexer.Index(ctx, chunks)
+	default:
+		if err := p.store.Upsert(ctx, chunks); err != nil {
+			return fmt.Errorf("store chunks: %w", err)
+		}
 	}
 
 	return nil
@@ -122,18 +180,46 @@ func (p *pipeline) Query(ctx context.Context, req QueryRequest) (*QueryResponse,
 	}
 
 	tenantID := getTenantIDFromContext(ctx)
-
-	results, err := p.retrieve(ctx, req.Query, RetrieveOptions{
+	retrieveOpts := RetrieveOptions{
 		TenantID: tenantID,
 		TopK:     req.TopK,
 		MinScore: req.MinScore,
 		Hybrid:   req.Hybrid,
-	}, req.QueryRewrite, req.UseHyDE)
+	}
+
+	// Route the query (or use caller-specified strategy).
+	route, err := p.router.Route(ctx, req.Query)
+	if err != nil {
+		route = defaultRoute()
+	}
+	if req.Strategy != "" {
+		route.Strategy = req.Strategy
+		route.UseDecompose = req.Strategy == "complex"
+		route.UseRewrite = req.Strategy == "comparison"
+	}
+
+	// Propagate per-request flags.
+	if req.UseHyDE {
+		route.UseHyDE = true
+	}
+	if req.QueryRewrite {
+		route.UseRewrite = true
+	}
+
+	var results []vectorstore.SearchResult
+
+	switch {
+	case route.UseDecompose:
+		results, err = p.decomposeAndRetrieve(ctx, req.Query, retrieveOpts)
+	case route.UseRewrite || route.UseHyDE:
+		results, err = p.retrieve(ctx, req.Query, retrieveOpts, route.UseRewrite, route.UseHyDE)
+	default:
+		results, err = p.retriever.Retrieve(ctx, req.Query, retrieveOpts)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("retrieve: %w", err)
 	}
 
-	// Rerank if requested
 	if req.Rerank && len(results) > 0 {
 		results, err = p.reranker.Rerank(ctx, req.Query, results)
 		if err != nil {
@@ -152,10 +238,11 @@ func (p *pipeline) Query(ctx context.Context, req QueryRequest) (*QueryResponse,
 	}
 
 	return &QueryResponse{
-		Answer:    genResp.Answer,
-		Citations: genResp.Citations,
-		Model:     genResp.Usage.Model,
-		Tokens:    genResp.Usage.TotalTokens,
+		Answer:      genResp.Answer,
+		Citations:   genResp.Citations,
+		Model:       genResp.Usage.Model,
+		Tokens:      genResp.Usage.TotalTokens,
+		RoutingInfo: routeInfoFromRoute(route),
 	}, nil
 }
 
@@ -165,13 +252,14 @@ func (p *pipeline) Search(ctx context.Context, req SearchRequest) ([]vectorstore
 	}
 
 	tenantID := getTenantIDFromContext(ctx)
-
-	results, err := p.retrieve(ctx, req.Query, RetrieveOptions{
+	retrieveOpts := RetrieveOptions{
 		TenantID: tenantID,
 		TopK:     req.TopK,
 		MinScore: req.MinScore,
 		Hybrid:   req.Hybrid,
-	}, req.QueryRewrite, req.UseHyDE)
+	}
+
+	results, err := p.retrieve(ctx, req.Query, retrieveOpts, req.QueryRewrite, req.UseHyDE)
 	if err != nil {
 		return nil, err
 	}
@@ -183,13 +271,11 @@ func (p *pipeline) Search(ctx context.Context, req SearchRequest) ([]vectorstore
 	return results, nil
 }
 
-// retrieve handles query rewriting, HyDE, and multi-query retrieval.
+// retrieve handles HyDE, multi-query rewriting with RRF, and standard retrieval.
 func (p *pipeline) retrieve(ctx context.Context, query string, opts RetrieveOptions, rewrite, useHyDE bool) ([]vectorstore.SearchResult, error) {
-	// HyDE: generate hypothetical document and use its embedding
 	if useHyDE {
 		hypoDoc, err := p.hyde.GenerateHypothetical(ctx, query)
 		if err == nil && hypoDoc != "" {
-			// Retrieve using the hypothetical document's embedding
 			results, err := p.retriever.Retrieve(ctx, hypoDoc, opts)
 			if err == nil && len(results) > 0 {
 				return results, nil
@@ -197,7 +283,6 @@ func (p *pipeline) retrieve(ctx context.Context, query string, opts RetrieveOpti
 		}
 	}
 
-	// Multi-query rewriting: expand query into multiple versions, retrieve from all
 	if rewrite {
 		queries, err := p.queryRewriter.Rewrite(ctx, query)
 		if err == nil && len(queries) > 1 {
@@ -205,34 +290,49 @@ func (p *pipeline) retrieve(ctx context.Context, query string, opts RetrieveOpti
 		}
 	}
 
-	// Standard retrieval
 	return p.retriever.Retrieve(ctx, query, opts)
 }
 
-// multiQueryRetrieve runs retrieval for multiple query variants and deduplicates.
-func (p *pipeline) multiQueryRetrieve(ctx context.Context, queries []string, opts RetrieveOptions) ([]vectorstore.SearchResult, error) {
-	seen := make(map[uuid.UUID]bool)
-	var allResults []vectorstore.SearchResult
+// decomposeAndRetrieve breaks the query into sub-questions, retrieves for each,
+// then merges with RRF fusion.
+func (p *pipeline) decomposeAndRetrieve(ctx context.Context, query string, opts RetrieveOptions) ([]vectorstore.SearchResult, error) {
+	subQuestions, err := p.decomposer.Decompose(ctx, query)
+	if err != nil || len(subQuestions) == 0 {
+		return p.retriever.Retrieve(ctx, query, opts)
+	}
 
+	resultSets := make([][]vectorstore.SearchResult, 0, len(subQuestions))
+	for _, q := range subQuestions {
+		results, err := p.retriever.Retrieve(ctx, q, opts)
+		if err != nil {
+			continue
+		}
+		resultSets = append(resultSets, results)
+	}
+
+	if len(resultSets) == 0 {
+		return p.retriever.Retrieve(ctx, query, opts)
+	}
+
+	return reciprocalRankFusion(resultSets, 60, opts.TopK), nil
+}
+
+// multiQueryRetrieve runs retrieval for multiple query variants and merges with RRF.
+func (p *pipeline) multiQueryRetrieve(ctx context.Context, queries []string, opts RetrieveOptions) ([]vectorstore.SearchResult, error) {
+	resultSets := make([][]vectorstore.SearchResult, 0, len(queries))
 	for _, q := range queries {
 		results, err := p.retriever.Retrieve(ctx, q, opts)
 		if err != nil {
 			continue
 		}
-		for _, r := range results {
-			if !seen[r.ChunkID] {
-				seen[r.ChunkID] = true
-				allResults = append(allResults, r)
-			}
-		}
+		resultSets = append(resultSets, results)
 	}
 
-	// Cap to TopK
-	if len(allResults) > opts.TopK {
-		allResults = allResults[:opts.TopK]
+	if len(resultSets) == 0 {
+		return nil, nil
 	}
 
-	return allResults, nil
+	return reciprocalRankFusion(resultSets, 60, opts.TopK), nil
 }
 
 func getTenantIDFromContext(ctx context.Context) uuid.UUID {

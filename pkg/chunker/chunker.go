@@ -12,7 +12,7 @@ type Chunker interface {
 type ChunkOptions struct {
 	ChunkSize    int    // target chunk size in characters
 	ChunkOverlap int    // overlap between chunks
-	Strategy     string // "fixed", "recursive", "sentence"
+	Strategy     string // "fixed", "recursive", "sentence", "semantic"
 }
 
 type TextChunk struct {
